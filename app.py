@@ -6,28 +6,47 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+import requests
 import streamlit as st
+
+import cloudinary
+import cloudinary.uploader
+
 
 # =========================
 # CONFIG
 # =========================
-APP_TITLE = "File Vault (súper simple, sin base de datos)"
+APP_TITLE = "File Vault (Cloudinary, sin BD)"
 BASE_DIR = Path(__file__).parent
-STORAGE_DIR = BASE_DIR / "storage"
-FILES_DIR = STORAGE_DIR / "files"
-INDEX_PATH = STORAGE_DIR / "index.json"
+STORAGE_DIR = BASE_DIR / "storage"          # cache local (no confiable en Streamlit Cloud)
+INDEX_PATH = STORAGE_DIR / "index.json"     # cache local del índice (la fuente real será Cloudinary)
+
+# Dónde guardamos el índice en Cloudinary (raw)
+VAULT_INDEX_PUBLIC_ID = os.environ.get("VAULT_INDEX_PUBLIC_ID", "filevault/index").strip()
+VAULT_INDEX_RESOURCE_TYPE = "raw"  # index.json como raw
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🗄️", layout="wide")
 
 
 # =========================
-# AUTH SIMPLE (OPCIONAL)
+# SECRETS / AUTH
 # =========================
-# Si defines VAULT_PASSWORD en el entorno, pedirá contraseña.
-# Ejemplo:
-#   export VAULT_PASSWORD="tu_clave"
-#   streamlit run app.py
-VAULT_PASSWORD = os.environ.get("VAULT_PASSWORD", "").strip()
+def get_secret(key: str, default: str = "") -> str:
+    # Streamlit Cloud -> st.secrets; local -> env
+    return (os.environ.get(key) or st.secrets.get(key, default) or default).strip()
+
+
+VAULT_PASSWORD = get_secret("VAULT_PASSWORD", "")
+CLOUDINARY_URL = get_secret("CLOUDINARY_URL", "")
+
+if not CLOUDINARY_URL:
+    st.error("Falta CLOUDINARY_URL en Secrets/entorno. Añádelo para guardar en Cloudinary.")
+    st.stop()
+
+# Cloudinary toma credenciales desde CLOUDINARY_URL
+os.environ["CLOUDINARY_URL"] = CLOUDINARY_URL
+
+# Password gate
 if VAULT_PASSWORD:
     if "auth_ok" not in st.session_state:
         st.session_state.auth_ok = False
@@ -49,24 +68,6 @@ if VAULT_PASSWORD:
 # =========================
 def ensure_dirs():
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    if not INDEX_PATH.exists():
-        INDEX_PATH.write_text(
-            json.dumps({"files": []}, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
-
-def load_index() -> dict:
-    try:
-        return json.loads(INDEX_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {"files": []}
-
-
-def save_index(data: dict) -> None:
-    tmp = INDEX_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(INDEX_PATH)
 
 
 def safe_filename(name: str) -> str:
@@ -75,39 +76,18 @@ def safe_filename(name: str) -> str:
     return "".join(ch if ch in allowed else "_" for ch in name)
 
 
-def list_scopes() -> list[str]:
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    scopes = ["general"]
-    for p in FILES_DIR.iterdir():
-        if p.is_dir():
-            scopes.append(p.name)
-    # dedupe manteniendo orden
-    seen = set()
-    out = []
-    for s in scopes:
-        if s not in seen:
-            out.append(s)
-            seen.add(s)
-    return out
-
-
-def scope_root(scope: str) -> Path:
-    scope = safe_filename((scope or "general").strip().lower()) or "general"
-    root = FILES_DIR / scope
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def month_folder_for_scope(scope: str, dt: datetime) -> Path:
-    root = scope_root(scope)
-    folder = root / dt.strftime("%Y-%m")
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
+def human_size(num_bytes: int) -> str:
+    n = float(num_bytes or 0)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{int(num_bytes)} B"
 
 
 def add_file_record(index: dict, record: dict):
     index.setdefault("files", [])
-    index["files"].insert(0, record)  # lo último arriba
+    index["files"].insert(0, record)
 
 
 def delete_file_record(index: dict, file_id: str):
@@ -124,57 +104,121 @@ def matches(rec: dict, query: str) -> bool:
     return query in name or query in tags or query in scope
 
 
-def human_size(num_bytes: int) -> str:
-    # simple y útil
-    n = float(num_bytes or 0)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if n < 1024 or unit == "TB":
-            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
-        n /= 1024
-    return f"{int(num_bytes)} B"
+def upload_index_to_cloudinary(index_data: dict) -> None:
+    """
+    Guarda index.json como asset RAW en Cloudinary, sobrescribiendo el anterior.
+    """
+    payload = json.dumps(index_data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    cloudinary.uploader.upload(
+        payload,
+        public_id=VAULT_INDEX_PUBLIC_ID,   # fijo
+        resource_type=VAULT_INDEX_RESOURCE_TYPE,
+        overwrite=True,
+        folder=None,                        # public_id ya incluye ruta
+    )
+
+    # cache local (útil para debug, pero no es la fuente de verdad en Cloud)
+    INDEX_PATH.write_text(payload.decode("utf-8"), encoding="utf-8")
+
+
+def download_index_from_cloudinary() -> dict:
+    """
+    Intenta descargar el index desde Cloudinary. Si no existe todavía, crea uno vacío.
+    """
+    try:
+        # Genera URL del raw asset y lo pide por HTTP
+        # Nota: el raw asset tiene URL pública (secure_url) una vez creado.
+        # Si aún no existe, esta llamada recognize fallback.
+        res = cloudinary.api.resource(
+            VAULT_INDEX_PUBLIC_ID,
+            resource_type=VAULT_INDEX_RESOURCE_TYPE
+        )
+        url = res.get("secure_url")
+        if not url:
+            raise RuntimeError("Index sin secure_url")
+
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        empty = {"files": []}
+        try:
+            upload_index_to_cloudinary(empty)
+        except Exception:
+            # si falla la creación, devolvemos vacío igualmente
+            pass
+        return empty
+
+
+def cloudinary_upload_file(data: bytes, scope: str, original_name: str, now: datetime) -> dict:
+    """
+    Sube cualquier archivo a Cloudinary usando resource_type='auto'
+    """
+    folder = f"filevault/{scope}/{now.strftime('%Y-%m')}"
+    upload_res = cloudinary.uploader.upload(
+        data,
+        folder=folder,
+        resource_type="auto",   # permite imágenes + pdf + zip + etc  [oai_citation:1‡Cloudinary](https://cloudinary.com/documentation/upload_parameters?utm_source=chatgpt.com)
+        use_filename=True,
+        unique_filename=True,
+    )
+    return upload_res
+
+
+def cloudinary_delete_asset(public_id: str, resource_type: str) -> None:
+    """
+    Borra asset en Cloudinary (image/video/raw).
+    """
+    cloudinary.uploader.destroy(public_id, resource_type=resource_type, invalidate=True)  #  [oai_citation:2‡Cloudinary](https://cloudinary.com/documentation/delete_assets?utm_source=chatgpt.com)
 
 
 # =========================
 # INIT
 # =========================
 ensure_dirs()
-idx = load_index()
+idx = download_index_from_cloudinary()
 files = idx.get("files", [])
 
 
 # =========================
-# SIDEBAR TOOLS
+# SIDEBAR
 # =========================
 st.sidebar.title("⚙️ Herramientas")
-st.sidebar.caption("Sin base de datos: solo disco + index.json")
 
-if st.sidebar.button("📦 Generar backup .zip"):
+if st.sidebar.button("🔄 Recargar índice"):
+    idx = download_index_from_cloudinary()
+    files = idx.get("files", [])
+    st.rerun()
+
+if st.sidebar.button("📦 Backup (index + manifest)"):
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
-        # index
-        if INDEX_PATH.exists():
-            z.write(INDEX_PATH, arcname="index.json")
-        # archivos
-        base_files = STORAGE_DIR / "files"
-        if base_files.exists():
-            for root, _, filenames in os.walk(base_files):
-                for fn in filenames:
-                    full = Path(root) / fn
-                    arc = str(full.relative_to(STORAGE_DIR))
-                    z.write(full, arcname=arc)
+        index_txt = json.dumps(idx, ensure_ascii=False, indent=2)
+        z.writestr("index.json", index_txt)
+
+        # manifest con URLs
+        lines = []
+        for f in idx.get("files", []):
+            ci = f.get("cloudinary", {})
+            lines.append(
+                f'{f.get("uploaded_at","")} | {f.get("scope","general")} | {f.get("original_name","")} | {ci.get("resource_type","")} | {ci.get("secure_url","")}'
+            )
+        z.writestr("manifest.txt", "\n".join(lines))
+
     mem.seek(0)
-    st.sidebar.download_button("⬇️ Descargar backup", mem, file_name="vault_backup.zip")
+    st.sidebar.download_button("⬇️ Descargar ZIP", mem, file_name="vault_backup.zip")
 
 st.sidebar.divider()
-st.sidebar.write(f"📁 Scopes detectados: **{len(list_scopes())}**")
 st.sidebar.write(f"📄 Archivos en índice: **{len(files)}**")
+st.sidebar.caption(f"Índice Cloudinary: public_id = {VAULT_INDEX_PUBLIC_ID} (raw)")
 
 
 # =========================
 # UI
 # =========================
-st.title("🗄️ File Vault (súper simple, sin base de datos)")
-st.caption("Guarda archivos en disco + un index.json para listarlos y buscarlos. Incluye carpetas por cliente/proyecto.")
+st.title("🗄️ File Vault (Cloudinary, sin BD)")
+st.caption("Los archivos se guardan en Cloudinary y el índice también (para que no se pierda al reiniciar Streamlit Cloud).")
 
 col1, col2 = st.columns([1, 1], gap="large")
 
@@ -182,50 +226,50 @@ col1, col2 = st.columns([1, 1], gap="large")
 with col1:
     st.subheader("⬆️ Subir archivo")
 
-    scopes = list_scopes()
-    scope_selected = st.selectbox("Carpeta / Proyecto", scopes, index=0)
-
-    new_scope = st.text_input("Crear nueva carpeta (opcional)", placeholder="cliente_nuevo o proyecto_x")
-    scope = safe_filename(new_scope.strip().lower()) if new_scope.strip() else scope_selected
+    scope = st.text_input("Carpeta / Proyecto", value="general", help="Ej: cliente_a, proyecto_x").strip().lower()
+    scope = safe_filename(scope) or "general"
 
     up = st.file_uploader("Elige un archivo", type=None)
     tags_txt = st.text_input("Tags (separados por coma)", placeholder="facturas, cliente_x, enero")
 
-    if up is not None:
-        if st.button("Guardar en vault", type="primary"):
-            now = datetime.now()
-            folder = month_folder_for_scope(scope, now)
+    if up is not None and st.button("Guardar en vault", type="primary"):
+        now = datetime.now()
 
-            original_name = up.name
-            clean_name = safe_filename(original_name)
-            file_id = uuid.uuid4().hex
-            stored_name = f"{file_id}__{clean_name}"
-            stored_path = folder / stored_name
+        original_name = up.name
+        file_id = uuid.uuid4().hex
+        data = up.getbuffer().tobytes()
 
-            data = up.getbuffer()
-            with open(stored_path, "wb") as f:
-                f.write(data)
-
+        try:
+            upload_res = cloudinary_upload_file(data, scope, original_name, now)
             record = {
                 "id": file_id,
                 "scope": scope,
                 "original_name": original_name,
-                "stored_relpath": str(stored_path.relative_to(STORAGE_DIR)),
-                "size_bytes": int(len(data)),
                 "uploaded_at": now.isoformat(timespec="seconds"),
                 "tags": [t.strip() for t in tags_txt.split(",") if t.strip()],
+                "cloudinary": {
+                    "public_id": upload_res.get("public_id"),
+                    "secure_url": upload_res.get("secure_url"),
+                    "bytes": int(upload_res.get("bytes", len(data))),
+                    "resource_type": upload_res.get("resource_type"),  # image / video / raw
+                    "format": upload_res.get("format"),
+                },
             }
 
             add_file_record(idx, record)
-            save_index(idx)
-            st.success(f"Guardado en '{scope}': {original_name}")
+            upload_index_to_cloudinary(idx)
+
+            st.success(f"Guardado en Cloudinary: {original_name}")
             st.rerun()
+
+        except Exception as e:
+            st.error(f"Error subiendo a Cloudinary: {e}")
 
 # ---------- LISTAR ----------
 with col2:
     st.subheader("📂 Archivos")
 
-    all_scopes = sorted(list({f.get("scope", "general") for f in files}))
+    all_scopes = sorted(list({f.get("scope", "general") for f in files})) if files else []
     scope_filter = st.selectbox("Ver carpeta", ["(todas)"] + all_scopes, index=0)
 
     q = st.text_input("Buscar por nombre o tag", placeholder="factura, png, cliente_x...")
@@ -240,57 +284,51 @@ with col2:
     st.write(f"Mostrando **{len(filtered)}** de **{len(files)}**")
 
     for rec in filtered:
-        stored_path = STORAGE_DIR / rec["stored_relpath"]
-        if not stored_path.exists():
-            with st.container(border=True):
-                st.warning(f"Archivo faltante en disco: {rec.get('original_name')} (id: {rec.get('id')})")
-            continue
+        ci = rec.get("cloudinary", {})
+        url = ci.get("secure_url", "")
+        public_id = ci.get("public_id", "")
+        rtype = ci.get("resource_type", "image")
+        size_bytes = int(ci.get("bytes", 0))
 
         with st.container(border=True):
             left, right = st.columns([3, 2], gap="large")
 
             with left:
-                st.markdown(f"**{rec['original_name']}**")
+                st.markdown(f"**{rec.get('original_name','(sin nombre)')}**")
                 st.caption(
                     f"Carpeta: {rec.get('scope','general')} · "
-                    f"Subido: {rec.get('uploaded_at')} · "
-                    f"Tamaño: {human_size(rec.get('size_bytes', 0))} · "
+                    f"Subido: {rec.get('uploaded_at','')} · "
+                    f"Tamaño: {human_size(size_bytes)} · "
                     f"Tags: {', '.join(rec.get('tags', [])) or '-'}"
                 )
 
-                # Preview simple
-                ext = Path(rec["original_name"]).suffix.lower()
+                # Preview simple: si es imagen, mostramos directamente
+                # (Cloudinary devuelve resource_type; para imágenes suele ser "image")
+                if rtype == "image" and url:
+                    st.image(url)
 
-                if ext in [".png", ".jpg", ".jpeg", ".webp"]:
-                    st.image(str(stored_path))
-                elif ext in [".txt", ".csv", ".log", ".md", ".json"]:
+                # Para textos/JSON pequeños, intentamos mostrar (si es raw y accesible)
+                ext = Path(rec.get("original_name", "")).suffix.lower()
+                if ext in [".txt", ".csv", ".log", ".md", ".json"] and url:
                     try:
-                        content = stored_path.read_text(encoding="utf-8", errors="ignore")
-                        st.code(content[:2500])
+                        rr = requests.get(url, timeout=15)
+                        if rr.ok:
+                            st.code(rr.text[:2500])
                     except Exception:
                         pass
-
-                st.caption(f"Ruta interna: {rec.get('stored_relpath')}")
 
             with right:
-                # Descargar
-                with open(stored_path, "rb") as f:
-                    st.download_button(
-                        label="⬇️ Descargar",
-                        data=f,
-                        file_name=rec["original_name"],
-                        mime="application/octet-stream",
-                        use_container_width=True,
-                        key=f"dl_{rec['id']}",
-                    )
+                if url:
+                    st.link_button("⬇️ Descargar / Abrir", url, use_container_width=True)
+                else:
+                    st.warning("Sin URL")
 
-                # Borrar
-                if st.button("🗑️ Borrar", use_container_width=True, key=f"del_{rec['id']}"):
+                if st.button("🗑️ Borrar", use_container_width=True, key=f"del_{rec.get('id')}"):
                     try:
-                        stored_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    delete_file_record(idx, rec["id"])
-                    save_index(idx)
-                    st.rerun()
-                    
+                        if public_id:
+                            cloudinary_delete_asset(public_id, rtype)
+                        delete_file_record(idx, rec.get("id"))
+                        upload_index_to_cloudinary(idx)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo borrar: {e}")
